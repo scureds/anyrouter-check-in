@@ -420,8 +420,8 @@ async def main():
 	if current_balance_hash:
 		if last_balance_hash is None:
 			# 首次运行
-			balance_changed = True
-			need_notify = True
+			# balance_changed = True
+			# need_notify = True
 			print('[NOTIFY] First run detected, will send notification with current balances')
 		elif current_balance_hash != last_balance_hash:
 			# 余额有变化
