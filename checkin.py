@@ -4,7 +4,6 @@ AnyRouter.top 自动签到脚本
 """
 
 import asyncio
-import hashlib
 import json
 import os
 import sys
@@ -19,35 +18,32 @@ from utils.notify import notify
 
 load_dotenv()
 
+# 文件名保持不变，但内容将改为存储详细的余额 JSON 数据
 BALANCE_HASH_FILE = 'balance_hash.txt'
 
 
-def load_balance_hash():
-	"""加载余额hash"""
+def load_saved_balances():
+	"""加载上次保存的余额数据 (支持解析新版 JSON)"""
 	try:
 		if os.path.exists(BALANCE_HASH_FILE):
 			with open(BALANCE_HASH_FILE, 'r', encoding='utf-8') as f:
-				return f.read().strip()
+				content = f.read().strip()
+				# 判断是否是新版的 JSON 格式 (旧版是 Hash 字符串)
+				if content.startswith('{'):
+					return json.loads(content)
 	except Exception:  # nosec B110
 		pass
 	return None
 
 
-def save_balance_hash(balance_hash):
-	"""保存余额hash"""
+def save_current_balances(balances):
+	"""保存当前的余额数据为 JSON 格式"""
 	try:
+		simple_balances = {k: v['quota'] for k, v in balances.items()} if balances else {}
 		with open(BALANCE_HASH_FILE, 'w', encoding='utf-8') as f:
-			f.write(balance_hash)
+			json.dump(simple_balances, f, ensure_ascii=False)
 	except Exception as e:
-		print(f'Warning: Failed to save balance hash: {e}')
-
-
-def generate_balance_hash(balances):
-	"""生成余额数据的hash"""
-	# 将包含 quota 和 used 的结构转换为简单的 quota 值用于 hash 计算
-	simple_balances = {k: v['quota'] for k, v in balances.items()} if balances else {}
-	balance_json = json.dumps(simple_balances, sort_keys=True, separators=(',', ':'))
-	return hashlib.sha256(balance_json.encode('utf-8')).hexdigest()[:16]
+		print(f'Warning: Failed to save balances: {e}')
 
 
 def parse_cookies(cookies_data):
@@ -208,14 +204,7 @@ def execute_check_in(client, account_name: str, provider_config, headers: dict):
 
 
 def format_check_in_notification(detail: dict) -> str:
-	"""格式化签到通知消息
-
-	Args:
-		detail: 包含签到详情的字典
-
-	Returns:
-		格式化后的通知消息
-	"""
+	"""格式化签到通知消息"""
 	lines = [
 		f'[CHECK-IN] {detail["name"]}',
 		'  ━━━━━━━━━━━━━━━━━━━━',
@@ -336,7 +325,8 @@ async def main():
 
 	print(f'[INFO] Found {len(accounts)} account configurations')
 
-	last_balance_hash = load_balance_hash()
+	# 加载上一次保存的余额记录
+	last_balances = load_saved_balances()
 
 	success_count = 0
 	total_count = len(accounts)
@@ -344,7 +334,6 @@ async def main():
 	current_balances = {}
 	account_check_in_details = {}  # 存储每个账号的签到详情
 	need_notify = False  # 是否需要发送通知
-	balance_changed = False  # 余额是否有变化
 
 	for i, account in enumerate(accounts):
 		account_key = f'account_{i + 1}'
@@ -355,6 +344,7 @@ async def main():
 
 			should_notify_this_account = False
 
+			# 如果报错或签到失败，直接加入通知
 			if not success:
 				should_notify_this_account = True
 				need_notify = True
@@ -399,6 +389,7 @@ async def main():
 						'success': success,
 					}
 
+			# 处理报错信息的组装
 			if should_notify_this_account:
 				account_name = account.get_display_name(i)
 				status = '[SUCCESS]' if success else '[FAIL]'
@@ -415,41 +406,53 @@ async def main():
 			need_notify = True  # 异常也需要通知
 			notification_content.append(f'[FAIL] {account_name} exception: {str(e)[:50]}...')
 
-	# 检查余额变化
-	current_balance_hash = generate_balance_hash(current_balances) if current_balances else None
-	if current_balance_hash:
-		if last_balance_hash is None:
-			# 首次运行
-			# balance_changed = True
-			# need_notify = True
-			print('[NOTIFY] First run detected, will send notification with current balances')
-		elif current_balance_hash != last_balance_hash:
-			# 余额有变化
-			balance_changed = True
-			need_notify = True
-			print('[NOTIFY] Balance changes detected, will send notification')
+	# ==============================
+	# 核心修改：检查余额变化并精准过滤
+	# ==============================
+	current_simple_balances = {k: v['quota'] for k, v in current_balances.items()} if current_balances else {}
+	
+	if current_simple_balances:
+		if last_balances is None:
+			# 首次运行或旧版 Hash 文件，不推送余额变动，直接保存当前状态为基准
+			print('[NOTIFY] First run or old hash format detected, saved current balances as baseline.')
 		else:
-			print('[INFO] No balance changes detected')
+			# 对比每个账号的余额是否发生变化
+			for i, account in enumerate(accounts):
+				account_key = f'account_{i + 1}'
+				if account_key in account_check_in_details:
+					detail = account_check_in_details[account_key]
+					account_name = detail['name']
+					
+					current_quota = current_simple_balances.get(account_key, 0)
+					last_quota = last_balances.get(account_key, current_quota)
+					
+					# 触发通知的条件：
+					# 1. 本次签到获得了奖励 (has_reward)
+					# 2. 本次运行期间有消耗 (has_usage)
+					# 3. 产生余额差值 (has_balance_change)
+					# 4. 与上次运行相比，整体余额发生了变化（跨次变动）(inter_run_change)
+					has_reward = detail['check_in_reward'] != 0
+					has_usage = detail['usage_increase'] != 0
+					has_balance_change = detail['balance_change'] != 0
+					inter_run_change = current_quota != last_quota
+					
+					if has_reward or has_usage or has_balance_change or inter_run_change:
+						need_notify = True
+						account_result = format_check_in_notification(detail)
+						
+						# 如果只是跨次运行产生的余额变化（例如在脚本未运行时您手动消耗了余额），修改通知文本更准确地表达
+						if inter_run_change and not (has_reward or has_usage or has_balance_change):
+							account_result = account_result.replace('  ℹ️  今日已签到，无变化', f'  ℹ️  余额自上次运行发生变动: ${last_quota:.2f} ➔ ${current_quota:.2f}')
+						
+						if not any(account_name in item for item in notification_content):
+							notification_content.append(account_result)
+							print(f'[NOTIFY] {account_name} has changes, added to notification.')
 
-	# 为有余额变化的情况添加所有成功账号到通知内容
-	if balance_changed:
-		for i, account in enumerate(accounts):
-			account_key = f'account_{i + 1}'
-			if account_key in account_check_in_details:
-				detail = account_check_in_details[account_key]
-				account_name = detail['name']
+	# 将当前完整的余额数据写入文件（替换原有的 Hash 写入逻辑）
+	if current_simple_balances:
+		save_current_balances(current_balances)
 
-				# 使用格式化函数生成通知消息
-				account_result = format_check_in_notification(detail)
-
-				# 检查是否已经在通知内容中（避免重复）
-				if not any(account_name in item for item in notification_content):
-					notification_content.append(account_result)
-
-	# 保存当前余额hash
-	if current_balance_hash:
-		save_balance_hash(current_balance_hash)
-
+	# 最终决定是否推送
 	if need_notify and notification_content:
 		# 构建通知内容
 		summary = [
