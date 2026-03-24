@@ -403,7 +403,7 @@ async def main():
                 has_balance_change = detail['balance_change'] != 0
                 
                 if has_balance_change:
-                    need_notify = True
+                    need_notify = False
                     account_result = format_check_in_notification(detail)
                     
                     if not any(account_name in item for item in notification_content):
