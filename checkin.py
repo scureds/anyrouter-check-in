@@ -315,41 +315,6 @@ def execute_check_in(client, account_name: str, provider_config, headers: dict):
 		return False
 
 
-def format_check_in_notification(detail: dict) -> str:
-	"""格式化签到通知消息"""
-	lines = [
-		f'[CHECK-IN] {detail["name"]}',
-		'  ━━━━━━━━━━━━━━━━━━━━',
-		'  签到前',
-		f'     余额: ${detail["before_quota"]:.2f}  |  累计消耗: ${detail["before_used"]:.2f}',
-		'  签到后',
-		f'     余额: ${detail["after_quota"]:.2f}  |  累计消耗: ${detail["after_used"]:.2f}',
-	]
-
-	has_reward = detail['check_in_reward'] != 0
-	has_usage = detail['usage_increase'] != 0
-
-	if has_reward or has_usage:
-		lines.append('  ━━━━━━━━━━━━━━━━━━━━')
-
-		if not has_reward and has_usage:
-			lines.append('  今日已签到（期间有使用）')
-
-		if has_reward:
-			lines.append(f'  签到获得: +${detail["check_in_reward"]:.2f}')
-
-		if has_usage:
-			lines.append(f'  期间消耗: ${detail["usage_increase"]:.2f}')
-
-		if detail['balance_change'] != 0:
-			change_symbol = '+' if detail['balance_change'] > 0 else ''
-			lines.append(f'  余额变化: {change_symbol}${detail["balance_change"]:.2f}')
-	else:
-		lines.extend(['  ━━━━━━━━━━━━━━━━━━━━', '  今日已签到，无变化'])
-
-	return '\n'.join(lines)
-
-
 async def check_in_account(account: AccountConfig, account_index: int, app_config: AppConfig):
 	"""为单个账号执行签到操作"""
 	account_name = account.get_display_name(account_index)
@@ -509,9 +474,7 @@ async def main():
 	total_count = len(accounts)
 	notification_content = []
 	current_balances = {}
-	account_check_in_details = {}
 	need_notify = False
-	balance_changed = False
 
 	for i, account in enumerate(accounts):
 		account_key = f'account_{i + 1}'
@@ -533,31 +496,6 @@ async def main():
 				current_used = user_info_after['used_quota']
 				current_balances[account_key] = {'quota': current_quota, 'used': current_used}
 
-				if user_info_before and user_info_before.get('success'):
-					before_quota = user_info_before['quota']
-					before_used = user_info_before['used_quota']
-					after_quota = user_info_after['quota']
-					after_used = user_info_after['used_quota']
-
-					total_before = before_quota + before_used
-					total_after = after_quota + after_used
-
-					check_in_reward = total_after - total_before
-					usage_increase = after_used - before_used
-					balance_change = after_quota - before_quota
-
-					account_check_in_details[account_key] = {
-						'name': account.get_display_name(i),
-						'before_quota': before_quota,
-						'before_used': before_used,
-						'after_quota': after_quota,
-						'after_used': after_used,
-						'check_in_reward': check_in_reward,
-						'usage_increase': usage_increase,
-						'balance_change': balance_change,
-						'success': success,
-					}
-
 			if should_notify_this_account:
 				account_name = account.get_display_name(i)
 				status = '[SUCCESS]' if success else '[FAIL]'
@@ -577,25 +515,11 @@ async def main():
 	current_balance_hash = generate_balance_hash(current_balances) if current_balances else None
 	if current_balance_hash:
 		if last_balance_hash is None:
-			balance_changed = True
-			need_notify = True
-			print('[NOTIFY] First run detected, will send notification with current balances')
+			print('[INFO] First run detected, successful check-in notification skipped')
 		elif current_balance_hash != last_balance_hash:
-			balance_changed = True
-			need_notify = True
-			print('[NOTIFY] Balance changes detected, will send notification')
+			print('[INFO] Balance changes detected, successful check-in notification skipped')
 		else:
 			print('[INFO] No balance changes detected')
-
-	if balance_changed:
-		for i, account in enumerate(accounts):
-			account_key = f'account_{i + 1}'
-			if account_key in account_check_in_details:
-				detail = account_check_in_details[account_key]
-				account_name = detail['name']
-				account_result = format_check_in_notification(detail)
-				if not any(account_name in item for item in notification_content):
-					notification_content.append(account_result)
 
 	if current_balance_hash:
 		save_balance_hash(current_balance_hash)
@@ -631,9 +555,9 @@ async def main():
 
 		print(notify_content)
 		notify.push_message('AnyRouter Check-in Alert', notify_content, msg_type='text')
-		print('[NOTIFY] Notification sent due to failures or balance changes')
+		print('[NOTIFY] Notification sent due to failures or exceptions')
 	else:
-		print('[INFO] All accounts successful and no balance changes detected, notification skipped')
+		print('[INFO] No failures detected, notification skipped')
 
 	sys.exit(0 if success_count > 0 else 1)
 
